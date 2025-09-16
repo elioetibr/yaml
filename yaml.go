@@ -31,6 +31,12 @@ import (
 	"unicode/utf8"
 )
 
+// PreserveBlankLines controls whether blank lines between elements are preserved
+// during YAML round-trip operations (parse -> encode -> parse).
+// When enabled, the parser tracks blank lines and the encoder outputs them.
+// Default is false for backward compatibility.
+var PreserveBlankLines = false
+
 // The Unmarshaler interface may be implemented by types to customize their
 // behavior when being unmarshaled from a YAML document.
 type Unmarshaler interface {
@@ -91,8 +97,9 @@ func Unmarshal(in []byte, out interface{}) (err error) {
 
 // A Decoder reads and decodes YAML values from an input stream.
 type Decoder struct {
-	parser      *parser
-	knownFields bool
+	parser             *parser
+	knownFields        bool
+	preserveBlankLines bool
 }
 
 // NewDecoder returns a new decoder that reads from r.
@@ -100,15 +107,30 @@ type Decoder struct {
 // The decoder introduces its own buffering and may read
 // data from r beyond the YAML values requested.
 func NewDecoder(r io.Reader) *Decoder {
-	return &Decoder{
-		parser: newParserFromReader(r),
+	dec := &Decoder{
+		parser:             newParserFromReader(r),
+		preserveBlankLines: PreserveBlankLines, // Use global default
 	}
+	dec.parser.preserveBlankLines = dec.preserveBlankLines
+	dec.parser.parser.preserve_blank_lines = dec.preserveBlankLines
+	return dec
 }
 
 // KnownFields ensures that the keys in decoded mappings to
 // exist as fields in the struct being decoded into.
 func (dec *Decoder) KnownFields(enable bool) {
 	dec.knownFields = enable
+}
+
+// SetPreserveBlankLines controls whether the decoder tracks blank lines
+// between elements for round-trip preservation. When enabled, the parser
+// populates BlankLinesBefore and BlankLinesAfter fields in Node structs.
+func (dec *Decoder) SetPreserveBlankLines(enable bool) {
+	dec.preserveBlankLines = enable
+	if dec.parser != nil {
+		dec.parser.preserveBlankLines = enable
+		dec.parser.parser.preserve_blank_lines = enable
+	}
 }
 
 // Decode reads the next YAML-encoded value from its input
@@ -157,6 +179,8 @@ func unmarshal(in []byte, out interface{}, strict bool) (err error) {
 	defer handleErr(&err)
 	d := newDecoder()
 	p := newParser(in)
+	p.preserveBlankLines = PreserveBlankLines
+	p.parser.preserve_blank_lines = PreserveBlankLines
 	defer p.destroy()
 	node := p.parse()
 	if node != nil {
@@ -227,16 +251,21 @@ func Marshal(in interface{}) (out []byte, err error) {
 
 // An Encoder writes YAML values to an output stream.
 type Encoder struct {
-	encoder *encoder
+	encoder            *encoder
+	preserveBlankLines bool
 }
 
 // NewEncoder returns a new encoder that writes to w.
 // The Encoder should be closed after use to flush all data
 // to w.
 func NewEncoder(w io.Writer) *Encoder {
-	return &Encoder{
-		encoder: newEncoderWithWriter(w),
+	e := &Encoder{
+		encoder:            newEncoderWithWriter(w),
+		preserveBlankLines: PreserveBlankLines, // Use global default
 	}
+	e.encoder.preserveBlankLines = e.preserveBlankLines
+	e.encoder.emitter.preserve_blank_lines = e.preserveBlankLines
+	return e
 }
 
 // Encode writes the YAML encoding of v to the stream.
@@ -276,6 +305,17 @@ func (e *Encoder) SetIndent(spaces int) {
 		panic("yaml: cannot indent to a negative number of spaces")
 	}
 	e.encoder.indent = spaces
+}
+
+// SetPreserveBlankLines controls whether the encoder outputs blank lines
+// from Node structs during encoding. When enabled, the encoder will output
+// BlankLinesBefore and BlankLinesAfter as specified in the Node fields.
+func (e *Encoder) SetPreserveBlankLines(enable bool) {
+	e.preserveBlankLines = enable
+	if e.encoder != nil {
+		e.encoder.preserveBlankLines = enable
+		e.encoder.emitter.preserve_blank_lines = enable
+	}
 }
 
 // Close closes the encoder by writing any remaining data.
@@ -413,12 +453,22 @@ type Node struct {
 	// These fields are not respected when encoding the node.
 	Line   int
 	Column int
+
+	// BlankLinesBefore holds the number of blank lines before this node.
+	// Only tracked when PreserveBlankLines is enabled.
+	BlankLinesBefore int
+
+	// BlankLinesAfter holds the number of blank lines after this node.
+	// Used primarily for sequence and mapping items to preserve spacing.
+	// Only tracked when PreserveBlankLines is enabled.
+	BlankLinesAfter int
 }
 
 // IsZero returns whether the node has all of its fields unset.
 func (n *Node) IsZero() bool {
 	return n.Kind == 0 && n.Style == 0 && n.Tag == "" && n.Value == "" && n.Anchor == "" && n.Alias == nil && n.Content == nil &&
-		n.HeadComment == "" && n.LineComment == "" && n.FootComment == "" && n.Line == 0 && n.Column == 0
+		n.HeadComment == "" && n.LineComment == "" && n.FootComment == "" && n.Line == 0 && n.Column == 0 &&
+		n.BlankLinesBefore == 0 && n.BlankLinesAfter == 0
 }
 
 

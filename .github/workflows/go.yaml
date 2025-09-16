@@ -1,61 +1,194 @@
----
 name: Go
 on: [push, pull_request]
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+
 jobs:
+  gitversion:
+    name: GitVersion
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # Cache GitVersion tool
+      - name: Cache GitVersion
+        uses: actions/cache@v4
+        with:
+          path: ~/.dotnet/tools
+          key: ${{ runner.os }}-gitversion-6.x
+          restore-keys: |
+            ${{ runner.os }}-gitversion-
+
+      - name: Install GitVersion
+        id: install-gitversion
+        uses: gittools/actions/gitversion/setup@v4.1.0
+        with:
+          versionSpec: '6.x'
+          preferLatestVersion: true
+      - name: Determine Version
+        id: gitversion
+        uses: gittools/actions/gitversion/execute@v4.1.0
+    outputs:
+      major: ${{ steps.gitversion.outputs.major }}
+      minor: ${{ steps.gitversion.outputs.minor }}
+      majorMinorPatch: ${{ steps.gitversion.outputs.majorMinorPatch }}
+      semVer: ${{ steps.gitversion.outputs.semVer }}
+      version: ${{ github.ref_name == github.event.repository.default_branch && steps.gitversion.outputs.majorMinorPatch || steps.gitversion.outputs.semVer }}
+
   test:
     name: Test
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
+    needs: [ gitversion ]
     strategy:
       fail-fast: false
       matrix:
         go:
-        - "1.5"
-        - "1.6"
-        - "1.7"
-        - "1.8"
-        - "1.9"
-        - "1.10"
-        - "1.11"
-        - "1.12"
-        - "1.13"
-        - "1.14"
-        - "1.15"
-        - "1.16.0-beta1"
-        - "tip"
+          - "1.25"
+          - "tip"
     env:
       GOPATH: ${{ github.workspace }}/go
     steps:
-    - name: Check out code into the Go module directory
-      uses: actions/checkout@v2
-      with:
-        path: ${{ github.workspace }}/go/src/gopkg.in/yaml.v3
-    - name: Set up Go ${{ matrix.go }}
-      if: matrix.go != 'tip'
-      uses: actions/setup-go@v2
-      with:
-        go-version: ${{ matrix.go }}
-        stable: false
-    - name: Set up Go ${{ matrix.go }}
-      if: matrix.go == 'tip'
-      run: |
-        export GOROOT_BOOTSTRAP=`go env GOROOT`
-        export GOROOT=$HOME/gotip
-        mkdir $HOME/gotip
-        cd $HOME/gotip
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v5
+        with:
+          path: ${{ github.workspace }}/go/src/gopkg.in/yaml.${{ needs.gitversion.outputs.version }}
 
-        curl -s 'https://go.googlesource.com/go/+/refs/heads/master?format=JSON' | awk '/"commit"/{print substr($2,2,40);exit}' >HEAD
-        awk '{printf("gotip-%s",substr($0,0,7))}' <HEAD >VERSION
+      # Cache Go modules
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            ${{ github.workspace }}/go/pkg
+          key: ${{ runner.os }}-go-${{ matrix.go }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-${{ matrix.go }}-
+            ${{ runner.os }}-go-
 
-        curl -s -o go.tar.gz https://go.googlesource.com/go/+archive/`cat HEAD`.tar.gz
-        tar xfz go.tar.gz
+      - name: Set up Go ${{ matrix.go }}
+        if: matrix.go != 'tip'
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+          cache: false  # We're using our own cache above
+      # Cache Go tip build
+      - name: Get Go tip commit
+        if: matrix.go == 'tip'
+        id: gotip-version
+        run: |
+          GOTIP_COMMIT=$(curl -s 'https://go.googlesource.com/go/+/refs/heads/master?format=JSON' | awk '/"commit"/{print substr($2,2,40);exit}')
+          echo "commit=${GOTIP_COMMIT}" >> $GITHUB_OUTPUT
+          echo "short=${GOTIP_COMMIT:0:7}" >> $GITHUB_OUTPUT
 
-        cd src
-        bash make.bash
+      - name: Cache Go tip
+        if: matrix.go == 'tip'
+        uses: actions/cache@v4
+        with:
+          path: ~/gotip
+          key: ${{ runner.os }}-gotip-${{ steps.gotip-version.outputs.commit }}
+          restore-keys: |
+            ${{ runner.os }}-gotip-
 
-        echo "GOROOT=$GOROOT" >> $GITHUB_ENV
-        echo "$GOROOT/bin" >> $GITHUB_PATH
-    - run: go version
-    - run: go get -t ./...
-      working-directory: ${{ github.workspace }}/go/src/gopkg.in/yaml.v3
-    - run: go test .
-      working-directory: ${{ github.workspace }}/go/src/gopkg.in/yaml.v3
+      - name: Set up Go ${{ matrix.go }}
+        if: matrix.go == 'tip'
+        run: |
+          export GOROOT_BOOTSTRAP=`go env GOROOT`
+          export GOROOT=$HOME/gotip
+
+          # Check if gotip is already cached
+          if [ ! -f "$GOROOT/VERSION" ] || [ "$(cat $GOROOT/VERSION 2>/dev/null)" != "gotip-${{ steps.gotip-version.outputs.short }}" ]; then
+            echo "Building Go tip..."
+            rm -rf $GOROOT
+            mkdir -p $GOROOT
+            cd $GOROOT
+
+            echo "${{ steps.gotip-version.outputs.commit }}" >HEAD
+            echo "gotip-${{ steps.gotip-version.outputs.short }}" >VERSION
+
+            curl -s -o go.tar.gz https://go.googlesource.com/go/+archive/`cat HEAD`.tar.gz
+            tar xfz go.tar.gz
+
+            cd src
+            bash make.bash
+          else
+            echo "Using cached Go tip build"
+          fi
+
+          echo "GOROOT=$GOROOT" >> $GITHUB_ENV
+          echo "$GOROOT/bin" >> $GITHUB_PATH
+      - run: go version
+      - run: go get -t ./...
+        working-directory: ${{ github.workspace }}/go/src/gopkg.in/yaml.${{ needs.gitversion.outputs.version }}
+      - run: go test .
+        working-directory: ${{ github.workspace }}/go/src/gopkg.in/yaml.${{ needs.gitversion.outputs.version }}
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [ gitversion, test ]
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Tag
+        id: tag
+        shell: bash -l {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          #!/usr/bin/env bash
+          
+          function tagger() {
+            VERSION=$1
+            echo "Releasing Version: ${VERSION}"
+            TAG_EXISTS=$(git ls-remote -q --tags | grep -q "refs/tags/${VERSION}$" && echo true || echo false)
+            if [[ "${TAG_EXISTS}" = true ]];
+            then
+              HAS_RELEASE=$(gh release list --json tagName -q '.[].tagName' | grep -E "^(${VERSION})$" && echo true || echo false)
+              if [[ "${HAS_RELEASE}" == true ]];
+              then
+                gh release delete --yes ${VERSION}
+              fi
+              git push origin --delete ${VERSION}
+              git tag -d ${VERSION}
+            fi
+          
+            echo
+            git tag -a ${VERSION} -m "chore: Release Version ${VERSION}"
+            git push -f --tags --follow-tags
+            git push --set-upstream origin ${{ github.ref_name }}
+            echo
+            echo
+          }
+          
+          tagger "v${{ needs.gitversion.outputs.version }}"
+          if [[ "${{ github.ref_name  }}" == "${{ github.event.repository.default_branch }}" ]];
+          then
+            tagger "v${{ needs.gitversion.outputs.major }}.${{ needs.gitversion.outputs.minor }}"
+            tagger "v${{ needs.gitversion.outputs.major }}"
+          fi
+
+      - name: Release
+        id: release
+        shell: bash -l {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          #!/usr/bin/env bash
+          
+          if [[ "${{ github.ref_name  }}" == "${{ github.event.repository.default_branch }}" ]];
+          then
+            gh release list | grep Draft | awk '{print $1 " \t"}' | while read -r draft; do echo "Removing Draft Releases: ${draft}"; gh release delete --yes "${draft}"; done
+            gh release create v${{ needs.gitversion.outputs.semVer }} --generate-notes --verify-tag --latest
+          fi

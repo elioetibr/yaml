@@ -24,6 +24,7 @@ package yaml
 
 import (
 	"bytes"
+	// "fmt"
 )
 
 // The parser implements the following grammar:
@@ -78,6 +79,9 @@ func peek_token(parser *yaml_parser_t) *yaml_token_t {
 // comments behind the position of the provided token into the respective
 // top-level comment slices in the parser.
 func yaml_parser_unfold_comments(parser *yaml_parser_t, token *yaml_token_t) {
+	// Track if we're adding a head comment with blank lines
+	var head_comment_blank_lines = 0
+
 	for parser.comments_head < len(parser.comments) && token.start_mark.index >= parser.comments[parser.comments_head].token_mark.index {
 		comment := &parser.comments[parser.comments_head]
 		if len(comment.head) > 0 {
@@ -89,6 +93,17 @@ func yaml_parser_unfold_comments(parser *yaml_parser_t, token *yaml_token_t) {
 				parser.head_comment = append(parser.head_comment, '\n')
 			}
 			parser.head_comment = append(parser.head_comment, comment.head...)
+			// Track blank lines from comment
+			if parser.preserve_blank_lines && comment.blank_lines_before > 0 {
+				// fmt.Printf("DEBUG unfold: Found blank_lines_before=%d from comment with head=%q\n", comment.blank_lines_before, string(comment.head))
+				if head_comment_blank_lines == 0 {
+					head_comment_blank_lines = comment.blank_lines_before
+				}
+				// Store directly on parser for head comment
+				if parser.head_comment_blank_lines == 0 {
+					parser.head_comment_blank_lines = comment.blank_lines_before
+				}
+			}
 		}
 		if len(comment.foot) > 0 {
 			if len(parser.foot_comment) > 0 {
@@ -104,6 +119,21 @@ func yaml_parser_unfold_comments(parser *yaml_parser_t, token *yaml_token_t) {
 		}
 		*comment = yaml_comment_t{}
 		parser.comments_head++
+	}
+
+	// If we collected head comment with blank lines, store them in parser state
+	// Also store them on the token itself if it's a scalar
+	if head_comment_blank_lines > 0 && len(parser.head_comment) > 0 {
+		// Store on the token if it's a scalar token
+		if token.typ == yaml_SCALAR_TOKEN && token.blank_lines_before == 0 {
+			token.blank_lines_before = head_comment_blank_lines
+			// fmt.Printf("DEBUG unfold: Set token.blank_lines_before=%d for scalar token\n", head_comment_blank_lines)
+		}
+		// Also set parser state
+		if parser.blank_lines_before == 0 {
+			parser.blank_lines_before = head_comment_blank_lines
+			// fmt.Printf("DEBUG unfold: Set parser.blank_lines_before=%d for head comment\n", head_comment_blank_lines)
+		}
 	}
 }
 
@@ -419,11 +449,29 @@ func yaml_parser_set_event_comments(parser *yaml_parser_t, event *yaml_event_t) 
 	event.head_comment = parser.head_comment
 	event.line_comment = parser.line_comment
 	event.foot_comment = parser.foot_comment
+	// If we have a head comment with blank lines, ensure they're set on the event
+	if parser.preserve_blank_lines && len(event.head_comment) > 0 {
+		// Use the dedicated head_comment_blank_lines field
+		if parser.head_comment_blank_lines > 0 {
+			// fmt.Printf("DEBUG set_event_comments: Using head_comment_blank_lines=%d\n", parser.head_comment_blank_lines)
+			if event.blank_lines_before == 0 {
+				event.blank_lines_before = parser.head_comment_blank_lines
+			}
+			parser.head_comment_blank_lines = 0 // Reset after use
+		} else if parser.blank_lines_before > 0 && event.blank_lines_before == 0 {
+			// Fallback to parser.blank_lines_before if available
+			// fmt.Printf("DEBUG set_event_comments: Using parser.blank_lines_before=%d\n", parser.blank_lines_before)
+			event.blank_lines_before = parser.blank_lines_before
+		}
+	}
+	// Always reset parser.blank_lines_before after transferring to event
+	parser.blank_lines_before = 0
 	parser.head_comment = nil
 	parser.line_comment = nil
 	parser.foot_comment = nil
 	parser.tail_comment = nil
 	parser.stem_comment = nil
+	parser.head_comment_blank_lines = 0
 }
 
 // Parse the productions:
@@ -454,6 +502,7 @@ func yaml_parser_set_event_comments(parser *yaml_parser_t, event *yaml_event_t) 
 //                                            ******
 func yaml_parser_parse_node(parser *yaml_parser_t, event *yaml_event_t, block, indentless_sequence bool) bool {
 	//defer trace("yaml_parser_parse_node", "block:", block, "indentless_sequence:", indentless_sequence)()
+	// fmt.Printf("DEBUG parser: parse_node called, parser.blank_lines_before=%d\n", parser.blank_lines_before)
 
 	token := peek_token(parser)
 	if token == nil {
@@ -558,6 +607,8 @@ func yaml_parser_parse_node(parser *yaml_parser_t, event *yaml_event_t, block, i
 			tag:        tag,
 			implicit:   implicit,
 			style:      yaml_style_t(yaml_BLOCK_SEQUENCE_STYLE),
+			blank_lines_before: parser.blank_lines_before,
+			blank_lines_after:  parser.blank_lines_after,
 		}
 		return true
 	}
@@ -582,6 +633,18 @@ func yaml_parser_parse_node(parser *yaml_parser_t, event *yaml_event_t, block, i
 			implicit:        plain_implicit,
 			quoted_implicit: quoted_implicit,
 			style:           yaml_style_t(token.style),
+			blank_lines_before: token.blank_lines_before,
+			blank_lines_after:  0,
+		}
+		// Use parser's blank lines if they were set (e.g., from BLOCK_ENTRY_TOKEN)
+		// Don't consume them yet if we might have a head comment
+		if parser.blank_lines_before > 0 {
+			// fmt.Printf("DEBUG parser_parse_node: parser.blank_lines_before=%d for scalar %q\n",
+				// parser.blank_lines_before, string(token.value))
+			if event.blank_lines_before == 0 {
+				event.blank_lines_before = parser.blank_lines_before
+			}
+			// Don't reset parser.blank_lines_before yet - let yaml_parser_set_event_comments handle it
 		}
 		yaml_parser_set_event_comments(parser, event)
 		skip_token(parser)
@@ -599,6 +662,8 @@ func yaml_parser_parse_node(parser *yaml_parser_t, event *yaml_event_t, block, i
 			tag:        tag,
 			implicit:   implicit,
 			style:      yaml_style_t(yaml_FLOW_SEQUENCE_STYLE),
+			blank_lines_before: parser.blank_lines_before,
+			blank_lines_after:  parser.blank_lines_after,
 		}
 		yaml_parser_set_event_comments(parser, event)
 		return true
@@ -614,6 +679,8 @@ func yaml_parser_parse_node(parser *yaml_parser_t, event *yaml_event_t, block, i
 			tag:        tag,
 			implicit:   implicit,
 			style:      yaml_style_t(yaml_FLOW_MAPPING_STYLE),
+			blank_lines_before: parser.blank_lines_before,
+			blank_lines_after:  parser.blank_lines_after,
 		}
 		yaml_parser_set_event_comments(parser, event)
 		return true
@@ -629,6 +696,8 @@ func yaml_parser_parse_node(parser *yaml_parser_t, event *yaml_event_t, block, i
 			tag:        tag,
 			implicit:   implicit,
 			style:      yaml_style_t(yaml_BLOCK_SEQUENCE_STYLE),
+			blank_lines_before: parser.blank_lines_before,
+			blank_lines_after:  parser.blank_lines_after,
 		}
 		if parser.stem_comment != nil {
 			event.head_comment = parser.stem_comment
@@ -647,6 +716,8 @@ func yaml_parser_parse_node(parser *yaml_parser_t, event *yaml_event_t, block, i
 			tag:        tag,
 			implicit:   implicit,
 			style:      yaml_style_t(yaml_BLOCK_MAPPING_STYLE),
+			blank_lines_before: parser.blank_lines_before,
+			blank_lines_after:  parser.blank_lines_after,
 		}
 		if parser.stem_comment != nil {
 			event.head_comment = parser.stem_comment
@@ -667,6 +738,8 @@ func yaml_parser_parse_node(parser *yaml_parser_t, event *yaml_event_t, block, i
 			implicit:        implicit,
 			quoted_implicit: false,
 			style:           yaml_style_t(yaml_PLAIN_SCALAR_STYLE),
+			blank_lines_before: 0,
+			blank_lines_after:  0,
 		}
 		return true
 	}
@@ -690,6 +763,7 @@ func yaml_parser_parse_block_sequence_entry(parser *yaml_parser_t, event *yaml_e
 		if token == nil {
 			return false
 		}
+		// fmt.Printf("DEBUG parser: block_seq first=true, skipping token type=%v\n", token.typ)
 		parser.marks = append(parser.marks, token.start_mark)
 		skip_token(parser)
 	}
@@ -698,19 +772,37 @@ func yaml_parser_parse_block_sequence_entry(parser *yaml_parser_t, event *yaml_e
 	if token == nil {
 		return false
 	}
+	// fmt.Printf("DEBUG parser: After skip/start, token type=%v\n", token.typ)
 
 	if token.typ == yaml_BLOCK_ENTRY_TOKEN {
 		mark := token.end_mark
 		prior_head_len := len(parser.head_comment)
+		// Save blank lines from the block entry token
+		blank_lines := token.blank_lines_before
+		// fmt.Printf("DEBUG parser: BLOCK_ENTRY found at line %d, blank_lines=%d\n",
+		//	token.start_mark.line, blank_lines)
 		skip_token(parser)
+		// Transfer blank lines to parser for the next node
+		// Always set it, even if 0, to ensure clean state
+		parser.blank_lines_before = blank_lines
+		if blank_lines > 0 {
+			// fmt.Printf("DEBUG parser[1]: BLOCK_ENTRY transferred blank_lines=%d\n", blank_lines)
+		}
 		yaml_parser_split_stem_comment(parser, prior_head_len)
+		// Save blank lines before peeking (which might reset them)
+		saved_blank_lines := parser.blank_lines_before
 		token = peek_token(parser)
 		if token == nil {
 			return false
 		}
+		// Restore blank lines after peeking
+		parser.blank_lines_before = saved_blank_lines
 		if token.typ != yaml_BLOCK_ENTRY_TOKEN && token.typ != yaml_BLOCK_END_TOKEN {
 			parser.states = append(parser.states, yaml_PARSE_BLOCK_SEQUENCE_ENTRY_STATE)
-			return yaml_parser_parse_node(parser, event, true, false)
+			// fmt.Printf("DEBUG parser[2]: About to call parse_node, blank_lines=%d\n", parser.blank_lines_before)
+			result := yaml_parser_parse_node(parser, event, true, false)
+			// fmt.Printf("DEBUG parser: After parse_node, result=%v\n", result)
+			return result
 		} else {
 			parser.state = yaml_PARSE_BLOCK_SEQUENCE_ENTRY_STATE
 			return yaml_parser_process_empty_scalar(parser, event, mark)
@@ -750,12 +842,23 @@ func yaml_parser_parse_indentless_sequence_entry(parser *yaml_parser_t, event *y
 	if token.typ == yaml_BLOCK_ENTRY_TOKEN {
 		mark := token.end_mark
 		prior_head_len := len(parser.head_comment)
+		// Save blank lines from the block entry token
+		blank_lines := token.blank_lines_before
 		skip_token(parser)
+		// Transfer blank lines to parser for the next node
+		if blank_lines > 0 {
+			// fmt.Printf("DEBUG parser: BLOCK_ENTRY (indentless) transferring blank_lines=%d to parser\n", blank_lines)
+			parser.blank_lines_before = blank_lines
+		}
 		yaml_parser_split_stem_comment(parser, prior_head_len)
+		// Save blank lines before peeking (which might reset them)
+		saved_blank_lines := parser.blank_lines_before
 		token = peek_token(parser)
 		if token == nil {
 			return false
 		}
+		// Restore blank lines after peeking
+		parser.blank_lines_before = saved_blank_lines
 		if token.typ != yaml_BLOCK_ENTRY_TOKEN &&
 			token.typ != yaml_KEY_TOKEN &&
 			token.typ != yaml_VALUE_TOKEN &&
@@ -963,6 +1066,8 @@ func yaml_parser_parse_flow_sequence_entry(parser *yaml_parser_t, event *yaml_ev
 				end_mark:   token.end_mark,
 				implicit:   true,
 				style:      yaml_style_t(yaml_FLOW_MAPPING_STYLE),
+				blank_lines_before: parser.blank_lines_before,
+				blank_lines_after:  parser.blank_lines_after,
 			}
 			skip_token(parser)
 			return true
@@ -1163,6 +1268,8 @@ func yaml_parser_process_empty_scalar(parser *yaml_parser_t, event *yaml_event_t
 		value:      nil, // Empty
 		implicit:   true,
 		style:      yaml_style_t(yaml_PLAIN_SCALAR_STYLE),
+		blank_lines_before: 0,
+		blank_lines_after:  0,
 	}
 	return true
 }

@@ -727,6 +727,8 @@ func yaml_emitter_emit_flow_mapping_value(emitter *yaml_emitter_t, event *yaml_e
 
 // Expect a block item node.
 func yaml_emitter_emit_block_sequence_item(emitter *yaml_emitter_t, event *yaml_event_t, first bool) bool {
+	// fmt.Printf("DEBUG emit: block_seq_item preserve=%v, blank_lines_before=%d, event_type=%v\n",
+	//	emitter.preserve_blank_lines, emitter.blank_lines_before, event.typ)
 	if first {
 		if !yaml_emitter_increase_indent(emitter, false, false) {
 			return false
@@ -742,8 +744,43 @@ func yaml_emitter_emit_block_sequence_item(emitter *yaml_emitter_t, event *yaml_
 	if !yaml_emitter_process_head_comment(emitter) {
 		return false
 	}
-	if !yaml_emitter_write_indent(emitter) {
-		return false
+
+	// Handle blank lines and indentation
+	if emitter.preserve_blank_lines && emitter.blank_lines_before > 0 {
+		// First, ensure we're at the start of a line
+		if emitter.column > 0 {
+			if !put_break(emitter) {
+				return false
+			}
+		}
+
+		// Now write the blank lines
+		for i := 0; i < emitter.blank_lines_before; i++ {
+			if !put_break(emitter) {
+				return false
+			}
+		}
+		emitter.blank_lines_before = 0
+
+		// After blank lines, manually add indentation
+		// We do this manually to avoid write_indent adding an extra break
+		indent := emitter.indent
+		if indent < 0 {
+			indent = 0
+		}
+		for emitter.column < indent {
+			if !put(emitter, ' ') {
+				return false
+			}
+		}
+		emitter.whitespace = true
+		emitter.space_above = false
+		emitter.foot_indent = -1
+	} else {
+		// Normal path - no blank lines needed
+		if !yaml_emitter_write_indent(emitter) {
+			return false
+		}
 	}
 	if !yaml_emitter_write_indicator(emitter, []byte{'-'}, true, false, true) {
 		return false
@@ -768,6 +805,61 @@ func yaml_emitter_emit_block_mapping_key(emitter *yaml_emitter_t, event *yaml_ev
 			return false
 		}
 	}
+
+	// Handle blank lines BEFORE processing head comment
+	if emitter.preserve_blank_lines && emitter.blank_lines_before > 0 && !first {
+		// For keys with comments, we need special handling
+		if len(emitter.head_comment) > 0 {
+			// Check if head comment ends with newlines - those represent blank lines after comment
+			trailingNewlines := 0
+			for i := len(emitter.head_comment) - 1; i >= 0 && emitter.head_comment[i] == '\n'; i-- {
+				trailingNewlines++
+			}
+
+			// Always emit blank lines before comment
+			// The blank lines in BLB are for the space before the comment
+			// For top-level keys, yaml_emitter_write_indent will emit one line break, so we emit one fewer
+			// For nested keys, we may need different handling
+			targetBreaks := emitter.blank_lines_before
+			if emitter.indent == 0 {
+				// Top-level mapping - adjust by 1
+				targetBreaks = targetBreaks - 1
+			}
+
+			if emitter.column > 0 {
+				if !put_break(emitter) {
+					return false
+				}
+			}
+			for i := 0; i < targetBreaks; i++ {
+				if !put_break(emitter) {
+					return false
+				}
+			}
+		} else {
+			// No comment - emit blank lines normally
+			// For top-level keys, yaml_emitter_write_indent will emit one line break, so we emit one fewer
+			// For nested keys, we may need different handling
+			targetBreaks := emitter.blank_lines_before
+			if emitter.indent == 0 {
+				// Top-level mapping - adjust by 1
+				targetBreaks = targetBreaks - 1
+			}
+
+			if emitter.column > 0 {
+				if !put_break(emitter) {
+					return false
+				}
+			}
+			for i := 0; i < targetBreaks; i++ {
+				if !put_break(emitter) {
+					return false
+				}
+			}
+		}
+		emitter.blank_lines_before = 0
+	}
+
 	if !yaml_emitter_process_head_comment(emitter) {
 		return false
 	}
@@ -887,6 +979,15 @@ func yaml_emitter_emit_alias(emitter *yaml_emitter_t, event *yaml_event_t) bool 
 
 // Expect SCALAR.
 func yaml_emitter_emit_scalar(emitter *yaml_emitter_t, event *yaml_event_t) bool {
+	// Emit blank lines for scalars that are not mapping keys
+	// Mapping keys are handled by emit_block_mapping_key
+	if emitter.preserve_blank_lines && emitter.blank_lines_before > 0 && !emitter.simple_key_context && !emitter.sequence_context {
+		if !yaml_emitter_write_blank_lines(emitter, emitter.blank_lines_before) {
+			return false
+		}
+		emitter.blank_lines_before = 0
+	}
+
 	if !yaml_emitter_select_scalar_style(emitter, event) {
 		return false
 	}
@@ -911,6 +1012,14 @@ func yaml_emitter_emit_scalar(emitter *yaml_emitter_t, event *yaml_event_t) bool
 
 // Expect SEQUENCE-START.
 func yaml_emitter_emit_sequence_start(emitter *yaml_emitter_t, event *yaml_event_t) bool {
+	// Write blank lines before the sequence if feature is enabled
+	if emitter.preserve_blank_lines && emitter.blank_lines_before > 0 {
+		if !yaml_emitter_write_blank_lines(emitter, emitter.blank_lines_before) {
+			return false
+		}
+		emitter.blank_lines_before = 0
+	}
+
 	if !yaml_emitter_process_anchor(emitter) {
 		return false
 	}
@@ -928,6 +1037,8 @@ func yaml_emitter_emit_sequence_start(emitter *yaml_emitter_t, event *yaml_event
 
 // Expect MAPPING-START.
 func yaml_emitter_emit_mapping_start(emitter *yaml_emitter_t, event *yaml_event_t) bool {
+	// Don't emit blank lines here - they are handled by emit_block_mapping_key
+
 	if !yaml_emitter_process_anchor(emitter) {
 		return false
 	}
@@ -1133,12 +1244,34 @@ func yaml_emitter_process_head_comment(emitter *yaml_emitter_t) bool {
 	if len(emitter.head_comment) == 0 {
 		return true
 	}
+
+	// Don't emit blank lines here - they are handled by the node's BlankLinesBefore
+	// which will be emitted before this function is called
+
+	// Check if comment ends with newlines - those represent blank lines after comment
+	trailingNewlines := 0
+	if len(emitter.head_comment) > 0 {
+		for i := len(emitter.head_comment) - 1; i >= 0 && emitter.head_comment[i] == '\n'; i-- {
+			trailingNewlines++
+		}
+	}
+
 	if !yaml_emitter_write_indent(emitter) {
 		return false
 	}
 	if !yaml_emitter_write_comment(emitter, emitter.head_comment) {
 		return false
 	}
+
+	// If comment had trailing newlines, emit additional blank lines
+	if emitter.preserve_blank_lines && trailingNewlines > 0 {
+		for i := 0; i < trailingNewlines; i++ {
+			if !put_break(emitter) {
+				return false
+			}
+		}
+	}
+
 	emitter.head_comment = emitter.head_comment[:0]
 	return true
 }
@@ -1413,6 +1546,12 @@ func yaml_emitter_analyze_event(emitter *yaml_emitter_t, event *yaml_event_t) bo
 	emitter.tag_data.suffix = nil
 	emitter.scalar_data.value = nil
 
+	// Track blank lines for round-trip preservation (only if feature is enabled)
+	if emitter.preserve_blank_lines {
+		emitter.blank_lines_before = event.blank_lines_before
+		emitter.blank_lines_after = event.blank_lines_after
+	}
+
 	if len(event.head_comment) > 0 {
 		emitter.head_comment = event.head_comment
 	}
@@ -1492,7 +1631,8 @@ func yaml_emitter_write_indent(emitter *yaml_emitter_t) bool {
 	if indent < 0 {
 		indent = 0
 	}
-	if !emitter.indention || emitter.column > indent || (emitter.column == indent && !emitter.whitespace) {
+	needBreak := !emitter.indention || emitter.column > indent || (emitter.column == indent && !emitter.whitespace)
+	if needBreak {
 		if !put_break(emitter) {
 			return false
 		}
@@ -1662,6 +1802,16 @@ func yaml_emitter_write_plain_scalar(emitter *yaml_emitter_t, value []byte, allo
 		emitter.open_ended = true
 	}
 
+	return true
+}
+
+// Write blank lines before an event.
+func yaml_emitter_write_blank_lines(emitter *yaml_emitter_t, count int) bool {
+	for i := 0; i < count; i++ {
+		if !put_break(emitter) {
+			return false
+		}
+	}
 	return true
 }
 

@@ -24,6 +24,7 @@ package yaml
 
 import (
 	"bytes"
+	// "fmt"
 	"fmt"
 )
 
@@ -646,10 +647,11 @@ func yaml_parser_set_scanner_tag_error(parser *yaml_parser_t, directive bool, co
 }
 
 func trace(args ...interface{}) func() {
-	pargs := append([]interface{}{"+++"}, args...)
-	fmt.Println(pargs...)
-	pargs = append([]interface{}{"---"}, args...)
-	return func() { fmt.Println(pargs...) }
+	// pargs := append([]interface{}{"+++"}, args...)
+	// fmt.Println(pargs...)
+	// pargs = append([]interface{}{"---"}, args...)
+	// return func() { fmt.Println(pargs...) }
+	return func() {}
 }
 
 // Ensure that the tokens queue contains at least one token which can be
@@ -700,6 +702,15 @@ func yaml_parser_fetch_next_token(parser *yaml_parser_t) (ok bool) {
 	// Eat whitespaces and comments until we reach the next token.
 	if !yaml_parser_scan_to_next_token(parser) {
 		return false
+	}
+
+	// Track blank lines for preservation (only if feature is enabled)
+	if parser.preserve_blank_lines && parser.newlines > 1 {
+		parser.blank_lines_before = parser.newlines - 1
+		// fmt.Printf("DEBUG scanner: Setting blank_lines_before=%d (newlines=%d) at line %d col %d\n",
+		//	parser.blank_lines_before, parser.newlines, parser.mark.line, parser.mark.column)
+	} else {
+		parser.blank_lines_before = 0
 	}
 
 	// [Go] While unrolling indents, transform the head comments of prior
@@ -1014,6 +1025,7 @@ func yaml_parser_roll_indent(parser *yaml_parser_t, column, number int, typ yaml
 			typ:        typ,
 			start_mark: mark,
 			end_mark:   mark,
+			blank_lines_before: parser.blank_lines_before,
 		}
 		if number > -1 {
 			number -= parser.tokens_parsed
@@ -1069,6 +1081,7 @@ func yaml_parser_unroll_indent(parser *yaml_parser_t, column int, scan_mark yaml
 			typ:        yaml_BLOCK_END_TOKEN,
 			start_mark: block_mark,
 			end_mark:   block_mark,
+			blank_lines_before: parser.blank_lines_before,
 		}
 		yaml_insert_token(parser, -1, &token)
 
@@ -1102,6 +1115,7 @@ func yaml_parser_fetch_stream_start(parser *yaml_parser_t) bool {
 		start_mark: parser.mark,
 		end_mark:   parser.mark,
 		encoding:   parser.encoding,
+		blank_lines_before: parser.blank_lines_before,
 	}
 	yaml_insert_token(parser, -1, &token)
 	return true
@@ -1322,7 +1336,10 @@ func yaml_parser_fetch_block_entry(parser *yaml_parser_t) bool {
 		typ:        yaml_BLOCK_ENTRY_TOKEN,
 		start_mark: start_mark,
 		end_mark:   end_mark,
+		blank_lines_before: parser.blank_lines_before,
 	}
+	// fmt.Printf("DEBUG scanner: Creating BLOCK_ENTRY_TOKEN with blank_lines_before=%d at line %d\n",
+	//	token.blank_lines_before, start_mark.line)
 	yaml_insert_token(parser, -1, &token)
 	return true
 }
@@ -1536,6 +1553,11 @@ func yaml_parser_scan_to_next_token(parser *yaml_parser_t) bool {
 
 	scan_mark := parser.mark
 
+	// Track blank lines from previous iterations
+	var pending_blank_lines = 0
+	var line_break_count = 0  // Count consecutive line breaks
+	var saved_newlines = 0    // Save newlines before they get reset
+
 	// Until the next token is not found.
 	for {
 		// Allow the BOM mark to start a line.
@@ -1555,11 +1577,23 @@ func yaml_parser_scan_to_next_token(parser *yaml_parser_t) bool {
 			return false
 		}
 
+		// Save newlines before eating whitespace (which resets it)
+		if saved_newlines == 0 && parser.newlines > 0 {
+			saved_newlines = parser.newlines
+		}
+
+		var had_spaces = false
 		for parser.buffer[parser.buffer_pos] == ' ' || ((parser.flow_level > 0 || !parser.simple_key_allowed) && parser.buffer[parser.buffer_pos] == '\t') {
 			skip(parser)
 			if parser.unread < 1 && !yaml_parser_update_buffer(parser, 1) {
 				return false
 			}
+			had_spaces = true
+		}
+		// Only reset line break count if we had spaces AND we're not at a comment
+		if had_spaces && parser.buffer[parser.buffer_pos] != '#' {
+			line_break_count = 0
+			saved_newlines = 0  // Reset saved newlines if not a comment
 		}
 
 		// Check if we just had a line comment under a sequence entry that
@@ -1587,9 +1621,23 @@ func yaml_parser_scan_to_next_token(parser *yaml_parser_t) bool {
 
 		// Eat a comment until a line break.
 		if parser.buffer[parser.buffer_pos] == '#' {
+			// Use saved_newlines if available (from before whitespace eating)
+			if parser.preserve_blank_lines && saved_newlines > 1 {
+				pending_blank_lines = saved_newlines - 1
+				// fmt.Printf("DEBUG scan_to_next: Setting parser.blank_lines_before=%d from saved_newlines=%d\n", pending_blank_lines, saved_newlines)
+				parser.blank_lines_before = pending_blank_lines
+			} else if parser.preserve_blank_lines && line_break_count > 1 {
+				// Fallback to line_break_count if no saved_newlines
+				pending_blank_lines = line_break_count - 1
+				// fmt.Printf("DEBUG scan_to_next: Setting parser.blank_lines_before=%d from line_break_count=%d\n", pending_blank_lines, line_break_count)
+				parser.blank_lines_before = pending_blank_lines
+			}
 			if !yaml_parser_scan_comments(parser, scan_mark) {
 				return false
 			}
+			pending_blank_lines = 0  // Reset after comment
+			line_break_count = 0     // Reset line break count
+			saved_newlines = 0       // Reset saved newlines
 		}
 
 		// If it is a line break, eat it.
@@ -1598,6 +1646,13 @@ func yaml_parser_scan_to_next_token(parser *yaml_parser_t) bool {
 				return false
 			}
 			skip_line(parser)
+			line_break_count++  // Count line breaks
+
+			// Track consecutive blank lines for preservation
+			if parser.preserve_blank_lines && parser.newlines > 1 {
+				pending_blank_lines = parser.newlines - 1
+				// fmt.Printf("DEBUG scan_to_next: After line break, pending_blank_lines=%d (newlines=%d, line_break_count=%d)\n", pending_blank_lines, parser.newlines, line_break_count)
+			}
 
 			// In the block context, a new line may start a simple key.
 			if parser.flow_level == 0 {
@@ -2369,6 +2424,7 @@ func yaml_parser_scan_block_scalar(parser *yaml_parser_t, token *yaml_token_t, l
 		end_mark:   end_mark,
 		value:      s,
 		style:      yaml_LITERAL_SCALAR_STYLE,
+		blank_lines_before: parser.blank_lines_before,
 	}
 	if !literal {
 		token.style = yaml_FOLDED_SCALAR_STYLE
@@ -2680,6 +2736,7 @@ func yaml_parser_scan_flow_scalar(parser *yaml_parser_t, token *yaml_token_t, si
 		end_mark:   end_mark,
 		value:      s,
 		style:      yaml_SINGLE_QUOTED_SCALAR_STYLE,
+		blank_lines_before: parser.blank_lines_before,
 	}
 	if !single {
 		token.style = yaml_DOUBLE_QUOTED_SCALAR_STYLE
@@ -2822,6 +2879,7 @@ func yaml_parser_scan_plain_scalar(parser *yaml_parser_t, token *yaml_token_t) b
 		end_mark:   end_mark,
 		value:      s,
 		style:      yaml_PLAIN_SCALAR_STYLE,
+		blank_lines_before: parser.blank_lines_before,
 	}
 
 	// Note that we change the 'simple_key_allowed' flag.
@@ -2904,6 +2962,13 @@ func yaml_parser_scan_comments(parser *yaml_parser_t, scan_mark yaml_mark_t) boo
 
 	var text []byte
 
+	// Track blank lines for preservation - start with any pending blank lines
+	var blank_line_count = 0
+	if parser.preserve_blank_lines && parser.blank_lines_before > 0 {
+		blank_line_count = parser.blank_lines_before
+		parser.blank_lines_before = 0  // Reset after consuming
+	}
+
 	// The foot line is the place where a comment must start to
 	// still be considered as a foot of the prior content.
 	// If there's some content in the currently parsed line, then
@@ -2942,11 +3007,12 @@ func yaml_parser_scan_comments(parser *yaml_parser_t, scan_mark yaml_mark_t) boo
 							token_mark = start_mark
 						}
 						parser.comments = append(parser.comments, yaml_comment_t{
-							scan_mark:  scan_mark,
-							token_mark: token_mark,
-							start_mark: start_mark,
-							end_mark:   yaml_mark_t{parser.mark.index + peek, line, column},
-							foot:       text,
+							scan_mark:          scan_mark,
+							token_mark:         token_mark,
+							start_mark:         start_mark,
+							end_mark:           yaml_mark_t{parser.mark.index + peek, line, column},
+							foot:               text,
+							blank_lines_before: blank_line_count,
 						})
 						scan_mark = yaml_mark_t{parser.mark.index + peek, line, column}
 						token_mark = scan_mark
@@ -2965,6 +3031,11 @@ func yaml_parser_scan_comments(parser *yaml_parser_t, scan_mark yaml_mark_t) boo
 			recent_empty = true
 			column = 0
 			line++
+			// Count consecutive blank lines before comments
+			if len(text) == 0 {
+				// We haven't started a comment yet, so count blank lines
+				blank_line_count++
+			}
 			continue
 		}
 
@@ -2972,11 +3043,12 @@ func yaml_parser_scan_comments(parser *yaml_parser_t, scan_mark yaml_mark_t) boo
 			// The comment at the different indentation is a foot of the
 			// preceding data rather than a head of the upcoming one.
 			parser.comments = append(parser.comments, yaml_comment_t{
-				scan_mark:  scan_mark,
-				token_mark: token_mark,
-				start_mark: start_mark,
-				end_mark:   yaml_mark_t{parser.mark.index + peek, line, column},
-				foot:       text,
+				scan_mark:          scan_mark,
+				token_mark:         token_mark,
+				start_mark:         start_mark,
+				end_mark:           yaml_mark_t{parser.mark.index + peek, line, column},
+				foot:               text,
+				blank_lines_before: blank_line_count,
 			})
 			scan_mark = yaml_mark_t{parser.mark.index + peek, line, column}
 			token_mark = scan_mark
@@ -2991,6 +3063,8 @@ func yaml_parser_scan_comments(parser *yaml_parser_t, scan_mark yaml_mark_t) boo
 			start_mark = yaml_mark_t{parser.mark.index + peek, line, column}
 		} else {
 			text = append(text, '\n')
+			// Reset blank line count for multi-line comments
+			blank_line_count = 0
 		}
 
 		recent_empty = false
@@ -3026,12 +3100,14 @@ func yaml_parser_scan_comments(parser *yaml_parser_t, scan_mark yaml_mark_t) boo
 	}
 
 	if len(text) > 0 {
+		// fmt.Printf("DEBUG: Creating head comment with blank_line_count=%d text=%q\n", blank_line_count, text)
 		parser.comments = append(parser.comments, yaml_comment_t{
-			scan_mark:  scan_mark,
-			token_mark: start_mark,
-			start_mark: start_mark,
-			end_mark:   yaml_mark_t{parser.mark.index + peek - 1, line, column},
-			head:       text,
+			scan_mark:          scan_mark,
+			token_mark:         start_mark,
+			start_mark:         start_mark,
+			end_mark:           yaml_mark_t{parser.mark.index + peek - 1, line, column},
+			head:               text,
+			blank_lines_before: blank_line_count,
 		})
 	}
 	return true

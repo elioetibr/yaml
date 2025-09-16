@@ -29,27 +29,34 @@ import (
 )
 
 type encoder struct {
-	emitter  yaml_emitter_t
-	event    yaml_event_t
-	out      []byte
-	flow     bool
-	indent   int
-	doneInit bool
+	emitter            yaml_emitter_t
+	event              yaml_event_t
+	out                []byte
+	flow               bool
+	indent             int
+	doneInit           bool
+	preserveBlankLines bool
 }
 
 func newEncoder() *encoder {
-	e := &encoder{}
+	e := &encoder{
+		preserveBlankLines: PreserveBlankLines,
+	}
 	yaml_emitter_initialize(&e.emitter)
 	yaml_emitter_set_output_string(&e.emitter, &e.out)
 	yaml_emitter_set_unicode(&e.emitter, true)
+	e.emitter.preserve_blank_lines = e.preserveBlankLines
 	return e
 }
 
 func newEncoderWithWriter(w io.Writer) *encoder {
-	e := &encoder{}
+	e := &encoder{
+		preserveBlankLines: PreserveBlankLines,
+	}
 	yaml_emitter_initialize(&e.emitter)
 	yaml_emitter_set_output_writer(&e.emitter, w)
 	yaml_emitter_set_unicode(&e.emitter, true)
+	e.emitter.preserve_blank_lines = e.preserveBlankLines
 	return e
 }
 
@@ -425,6 +432,22 @@ func (e *encoder) emitScalar(value, anchor, tag string, style yaml_scalar_style_
 	e.emit()
 }
 
+func (e *encoder) emitScalarWithBlankLines(value, anchor, tag string, style yaml_scalar_style_t,
+	head, line, foot, tail []byte, blankLinesBefore, blankLinesAfter int) {
+	implicit := tag == ""
+	if !implicit {
+		tag = longTag(tag)
+	}
+	e.must(yaml_scalar_event_initialize(&e.event, []byte(anchor), []byte(tag), []byte(value), implicit, implicit, style))
+	e.event.head_comment = head
+	e.event.line_comment = line
+	e.event.foot_comment = foot
+	e.event.tail_comment = tail
+	e.event.blank_lines_before = blankLinesBefore
+	e.event.blank_lines_after = blankLinesAfter
+	e.emit()
+}
+
 func (e *encoder) nodev(in reflect.Value) {
 	e.node(in.Interface().(*Node), "")
 }
@@ -468,16 +491,27 @@ func (e *encoder) node(node *Node, tail string) {
 		}
 	}
 
+	// Emit blank lines before the node if feature is enabled
+	if e.preserveBlankLines && node.BlankLinesBefore > 0 {
+		e.event.blank_lines_before = node.BlankLinesBefore
+	}
+
 	switch node.Kind {
 	case DocumentNode:
 		yaml_document_start_event_initialize(&e.event, nil, nil, true)
 		e.event.head_comment = []byte(node.HeadComment)
+		if e.preserveBlankLines {
+			e.event.blank_lines_before = node.BlankLinesBefore
+		}
 		e.emit()
 		for _, node := range node.Content {
 			e.node(node, "")
 		}
 		yaml_document_end_event_initialize(&e.event, true)
 		e.event.foot_comment = []byte(node.FootComment)
+		if e.preserveBlankLines {
+			e.event.blank_lines_after = node.BlankLinesAfter
+		}
 		e.emit()
 
 	case SequenceNode:
@@ -487,6 +521,9 @@ func (e *encoder) node(node *Node, tail string) {
 		}
 		e.must(yaml_sequence_start_event_initialize(&e.event, []byte(node.Anchor), []byte(longTag(tag)), tag == "", style))
 		e.event.head_comment = []byte(node.HeadComment)
+		if e.preserveBlankLines {
+			e.event.blank_lines_before = node.BlankLinesBefore
+		}
 		e.emit()
 		for _, node := range node.Content {
 			e.node(node, "")
@@ -494,6 +531,9 @@ func (e *encoder) node(node *Node, tail string) {
 		e.must(yaml_sequence_end_event_initialize(&e.event))
 		e.event.line_comment = []byte(node.LineComment)
 		e.event.foot_comment = []byte(node.FootComment)
+		if e.preserveBlankLines {
+			e.event.blank_lines_after = node.BlankLinesAfter
+		}
 		e.emit()
 
 	case MappingNode:
@@ -504,6 +544,9 @@ func (e *encoder) node(node *Node, tail string) {
 		yaml_mapping_start_event_initialize(&e.event, []byte(node.Anchor), []byte(longTag(tag)), tag == "", style)
 		e.event.tail_comment = []byte(tail)
 		e.event.head_comment = []byte(node.HeadComment)
+		if e.preserveBlankLines {
+			e.event.blank_lines_before = node.BlankLinesBefore
+		}
 		e.emit()
 
 		// The tail logic below moves the foot comment of prior keys to the following key,
@@ -530,6 +573,9 @@ func (e *encoder) node(node *Node, tail string) {
 		e.event.tail_comment = []byte(tail)
 		e.event.line_comment = []byte(node.LineComment)
 		e.event.foot_comment = []byte(node.FootComment)
+		if e.preserveBlankLines {
+			e.event.blank_lines_after = node.BlankLinesAfter
+		}
 		e.emit()
 
 	case AliasNode:
@@ -537,6 +583,10 @@ func (e *encoder) node(node *Node, tail string) {
 		e.event.head_comment = []byte(node.HeadComment)
 		e.event.line_comment = []byte(node.LineComment)
 		e.event.foot_comment = []byte(node.FootComment)
+		if e.preserveBlankLines {
+			e.event.blank_lines_before = node.BlankLinesBefore
+			e.event.blank_lines_after = node.BlankLinesAfter
+		}
 		e.emit()
 
 	case ScalarNode:
@@ -570,7 +620,14 @@ func (e *encoder) node(node *Node, tail string) {
 			style = yaml_DOUBLE_QUOTED_SCALAR_STYLE
 		}
 
-		e.emitScalar(value, node.Anchor, tag, style, []byte(node.HeadComment), []byte(node.LineComment), []byte(node.FootComment), []byte(tail))
+		// Pass blank line information for scalars
+		if e.preserveBlankLines {
+			e.emitScalarWithBlankLines(value, node.Anchor, tag, style,
+				[]byte(node.HeadComment), []byte(node.LineComment), []byte(node.FootComment), []byte(tail),
+				node.BlankLinesBefore, node.BlankLinesAfter)
+		} else {
+			e.emitScalar(value, node.Anchor, tag, style, []byte(node.HeadComment), []byte(node.LineComment), []byte(node.FootComment), []byte(tail))
+		}
 	default:
 		failf("cannot encode node with unknown kind %d", node.Kind)
 	}

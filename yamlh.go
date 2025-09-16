@@ -239,6 +239,9 @@ type yaml_token_t struct {
 
 	// The version directive major/minor (for yaml_VERSION_DIRECTIVE_TOKEN).
 	major, minor int8
+
+	// Blank line tracking for round-trip preservation
+	blank_lines_before int // Number of blank lines before this token
 }
 
 // Events
@@ -308,6 +311,10 @@ type yaml_event_t struct {
 	line_comment []byte
 	foot_comment []byte
 	tail_comment []byte
+
+	// Blank line tracking for round-trip preservation
+	blank_lines_before int // Number of blank lines before this event
+	blank_lines_after  int // Number of blank lines after this event
 
 	// The anchor (for yaml_SCALAR_EVENT, yaml_SEQUENCE_START_EVENT, yaml_MAPPING_START_EVENT, yaml_ALIAS_EVENT).
 	anchor []byte
@@ -602,8 +609,16 @@ type yaml_parser_t struct {
 	tail_comment []byte // Foot comment that happens at the end of a block.
 	stem_comment []byte // Comment in item preceding a nested structure (list inside list item, etc)
 
+	// Track blank lines that should be associated with head comments
+	head_comment_blank_lines int
+
 	comments      []yaml_comment_t // The folded comments for all parsed tokens
 	comments_head int
+
+	// Blank line tracking for round-trip preservation
+	preserve_blank_lines bool // Whether to preserve blank lines
+	blank_lines_before   int  // Number of blank lines before current event
+	blank_lines_after    int  // Number of blank lines after current event
 
 	// Scanner stuff
 
@@ -648,6 +663,8 @@ type yaml_comment_t struct {
 	head []byte
 	line []byte
 	foot []byte
+
+	blank_lines_before int // Number of blank lines before this comment
 }
 
 // Emitter Definitions
@@ -788,6 +805,11 @@ type yaml_emitter_t struct {
 	tail_comment []byte
 
 	key_line_comment []byte
+
+	// Blank line tracking for round-trip preservation
+	preserve_blank_lines bool // Whether to preserve blank lines
+	blank_lines_before   int  // Number of blank lines to emit before current event
+	blank_lines_after    int  // Number of blank lines to emit after current event
 
 	// Dumper stuff
 

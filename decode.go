@@ -30,12 +30,13 @@ import (
 // Parser, produces a node tree out of a libyaml event stream.
 
 type parser struct {
-	parser   yaml_parser_t
-	event    yaml_event_t
-	doc      *Node
-	anchors  map[string]*Node
-	doneInit bool
-	textless bool
+	parser             yaml_parser_t
+	event              yaml_event_t
+	doc                *Node
+	anchors            map[string]*Node
+	doneInit           bool
+	textless           bool
+	preserveBlankLines bool
 }
 
 func newParser(b []byte) *parser {
@@ -189,6 +190,15 @@ func (p *parser) node(kind Kind, defaultTag, tag, value string) *Node {
 		n.HeadComment = string(p.event.head_comment)
 		n.LineComment = string(p.event.line_comment)
 		n.FootComment = string(p.event.foot_comment)
+		// Track blank lines if feature is enabled
+		if p.preserveBlankLines {
+			n.BlankLinesBefore = p.event.blank_lines_before
+			n.BlankLinesAfter = p.event.blank_lines_after
+			// Debug: Check if we're losing blank lines for nodes with comments
+			// if n.HeadComment != "" && p.event.blank_lines_before == 0 {
+			//     fmt.Printf("DEBUG decode: Node with HeadComment but no blank lines: %q\n", n.Value)
+			// }
+		}
 	}
 	return n
 }
